@@ -9,7 +9,6 @@ import pandas as pd
 
 """preprocessing auction data into features. This is currently done per auction."""
 #will need to do something special for dutch versus normal auctions later... maybe can just be a dummy var flag for now. 
-
 auctions = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/blocknative_auctions/datasets/auction118.csv')
 auctions["gas_eth"] = auctions["gas_limit"]*auctions["gas_price"]
 auctions["timestamp"] = pd.to_datetime(auctions["timestamp"])
@@ -30,31 +29,37 @@ def recursive_tx_search(key):
     else:
         return key
 
-def try_replace(x):
+def try_replace_root_tx(x):
     try:
-        # we need to recursively call the dictionary to find the root hash
+        # we need to recursively call the dictionary to find the root hash, since many actions will drop the original and replace it
         return recursive_tx_search(x)
     except:
         return x
 
-auctions["tx_hash"] = auctions["tx_hash"].apply(lambda x: try_replace(x))
+auctions["tx_hash"] = auctions["tx_hash"].apply(lambda x: try_replace_root_tx(x))
 
-user_state_pivot = auctions.pivot_table(index=["sender","tx_hash"], columns="status",values="gas_eth", aggfunc="count")
+user_state_pivot = auctions.pivot_table(index=["sender"], columns="status",values="gas_eth", aggfunc="count")
 user_state_pivot.fillna(0, inplace=True)
-
 #first time I forgot to filter for drops, so we have 4 missing final tx states here. Future shouldn't need this.
 user_state_pivot = user_state_pivot[~user_state_pivot[["cancel","confirmed","failed"]].eq(0).all(1)] 
+user_state_pivot.drop(columns="pending", inplace=True)
+user_number_submitted = auctions.pivot_table(index="sender", values="tx_hash", aggfunc=lambda x: len(x.unique()))
+user_number_submitted.columns = ["number_submitted"]
 
-##configure columns for PCA
-columns = ["number_submitted","number_speedups","number_confirmed","number_failed","number_cancelled","average_gas_difference"]
+user_state_featurized = pd.merge(user_number_submitted.reset_index(),user_state_pivot.reset_index(),on="sender",how="outer")
 
-# user_state_featurized = 
+##calculate avg gas per block difference between pending/speedup and confirmed. shift by 1 since it is pending for next block
+gas_activity = auctions[(auctions["status"]=="pending") | (auctions["status"]=="speedup")].pivot_table(index="sender", columns="blocknumber",values="gas_eth", aggfunc="mean")
+a = gas_activity.shift(1, axis=1) # this doesn't work since some blocknumbers didn't make it. So we need to keep past columns
+gas_needed = auctions[auctions["status"]=="confirmed"].pivot_table(index="blocknumber",values="gas_eth", aggfunc="mean")
+columns_to_keep = set(gas_needed.index) - set(gas_activity.columns)
+gas_activity = gas_activity.loc[:,list(gas_needed.index)] #only keep up to the last block where there was a confirmation
 
-##calculate avg gas per block difference between pending/speedup and confirmed
-#essentially need block pivot with user...?
+temp = gas_activity.subtract(gas_needed, axis=1) #how to do this on uneven frames
 
-##time between speedups is better than based on auction time
-# calc time between, with 1000 as the value if they never did more than one action. need to map time between first pending and sub speedups or cancel
+# calc time between any actions, with 1000 as the value if they never did more than one action. 
+# need to keep only first pending for each tx hash, as well as remove any failed/confirmed. Then can take column distance somehow, and average across users. 
+time_action = auctions.pivot_table(index=["sender","tx_hash"], columns="blocknumber",values="status",aggfunc="count") 
 
 # get full user list
 all_users = list(set(auctions["sender"].apply(lambda x: x.replace('0x','\\x'))))
