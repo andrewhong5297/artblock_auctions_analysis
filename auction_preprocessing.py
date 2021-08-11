@@ -10,7 +10,12 @@ import numpy as np
 
 """preprocessing auction data into features. This is currently done per auction."""
 #will need to do something special for dutch versus normal auctions later... maybe can just be a dummy var flag for now. 
-auctions = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/blocknative_auctions/datasets/auction118.csv')
+# project_details_mapping = 
+# project_details_json = 
+# combined_project_details = 
+# merged next to auctions data? this should provide clarity in various charts
+
+auctions = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/auction118.csv')
 auctions["sender"] = auctions["sender"].apply(lambda x: x.lower())
 auctions["gas_eth"] = auctions["gas_limit"]*auctions["gas_price"]
 auctions["timestamp"] = pd.to_datetime(auctions["timestamp"])
@@ -50,11 +55,23 @@ user_number_submitted = auctions.pivot_table(index="sender", values="tx_hash", a
 user_number_submitted.columns = ["number_submitted"]
 
 ##calculate avg gas per block difference between pending/speedup and confirmed. shift by 1 since it is pending for next block
-gas_activity = auctions[(auctions["status"]=="pending") | (auctions["status"]=="speedup")].pivot_table(index="sender", columns="blocknumber",values="gas_eth", aggfunc="mean") \
+gas_activity = auctions.pivot_table(index="sender", columns="blocknumber",values="gas_eth", aggfunc="mean") \
                 .reindex(set(auctions["blocknumber"]), axis=1, fill_value=np.nan)
-gas_activity = gas_activity.shift(1, axis=1) # this doesn't work since some blocknumbers didn't make it. So we need to keep past columns
-gas_needed = auctions[auctions["status"]=="confirmed"].pivot_table(index="blocknumber",values="gas_eth", aggfunc="mean").T
-gas_activity = gas_activity.loc[:,list(gas_needed.columns)] #only keep up to the last block where there was a confirmation
+gas_activity = gas_activity.T.reset_index().sort_values(by="blocknumber",ascending=True).set_index("blocknumber").T
+
+def fill_pending_values(x):
+    first = x.first_valid_index()
+    last = x.last_valid_index()
+    x.loc[first:last] = x.loc[first:last].fillna(method="ffill")
+    return x
+
+gas_activity = gas_activity.apply(lambda x: fill_pending_values(x), axis=1)
+
+gas_needed = auctions[auctions["status"]=="confirmed"].pivot_table(columns="blocknumber",values="gas_eth", aggfunc="mean") \
+                    .reindex(set(auctions["blocknumber"]), axis=1, fill_value=np.nan)
+gas_needed = gas_needed.T.reset_index().sort_values(by="blocknumber",ascending=True).set_index("blocknumber")
+gas_needed = gas_needed.fillna(method="backfill").fillna(method="ffill")
+gas_needed = gas_needed.T
 
 for number in gas_needed.columns:
     gas_activity[number] = gas_activity[number] - gas_needed[number][0] #positive is extra gas, negative is missing gas
@@ -94,12 +111,12 @@ user_state_featurized = pd.merge(user_number_submitted.reset_index(),user_state_
 user_state_featurized = pd.merge(user_state_featurized,gas_activity["average_gas_behavior"].reset_index(),on="sender",how="outer")
 user_state_featurized = pd.merge(user_state_featurized,users_actions["average_action_delay"].reset_index(),on="sender",how="outer")
 
-# get full user list
-all_users = list(set(auctions["sender"].apply(lambda x: x.replace('0x','\\x'))))
-all_users_string = "'),('".join(all_users)
+# # get full user list
+# all_users = list(set(auctions["sender"].apply(lambda x: x.replace('0x','\\x'))))
+# all_users_string = "'),('".join(all_users)
 
 """appending user wallet data"""
-wh = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/blocknative_auctions/datasets/wallet_summaries.csv')
+wh = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/wallet_summaries.csv')
 
 wh["user_address"] = wh["user_address"].apply(lambda x: x.replace("\\x","0x"))
 wh = wh.rename(columns={'user_address':'sender'})
@@ -107,12 +124,38 @@ wh["time_since_first_tx"] = wh["time_since_first_tx"].apply(lambda x: "0" if x =
 wh["time_since_first_tx"]=wh["time_since_first_tx"].apply(lambda x: int(x.split(" ")[0]))
 
 user_state_featurized = pd.merge(user_state_featurized,wh,on="sender",how="outer")
+user_state_featurized.set_index("sender",inplace=True)
+user_state_featurized.dropna(inplace=True) #shouldn't need this after
+
+"""EDA viz"""
+#do some pairplots here and heatmap stuff ()
 
 """PCA and k-means"""
-# project_details_mapping = 
-# project_details_json = 
-# combined_project_details = 
-# merged next to auctions data? this should provide clarity in various charts
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+pca = PCA(n_components=10)
+principalComponents = pca.fit_transform(user_state_featurized) #replace with cosine or clust_df
+
+PCA_components = pd.DataFrame(principalComponents)
+
+from sklearn.cluster import KMeans
+X = PCA_components
+k = 4
+kmeans = KMeans(n_clusters=k)
+y_pred = kmeans.fit_predict(X)
+
+PCA_components["clusters"] = y_pred
+PCA_components["sender"]= user_state_featurized.index
+PCA_components.set_index("sender",inplace=True)
+PCA_to_merge = PCA_components[["clusters",0,1]]
+PCA_to_merge.columns = ["clusters","PCA_0","PCA_1"]
+merged_components = pd.concat([PCA_to_merge, user_state_featurized],axis=1)
+
+fig, ax = plt.subplots(figsize=(10,10))
+sns.scatterplot(data=merged_components, x="PCA_0",y="PCA_1",hue="clusters", ax=ax)
+ax.set(title="User Auction Behavior Groups")
 
 """histogram of an auction over time"""
 # import seaborn as sns
