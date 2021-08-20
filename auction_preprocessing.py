@@ -41,10 +41,6 @@ for project in list(set(auctions["projectId"])):
     to_remove_indicies.extend(auction_spec.index[auction_spec['blocknumber'].isin(to_remove_blocktimes)].tolist())
 auctions.drop(index=to_remove_indicies, inplace=True)
 
-# # get full user list for dune query
-# all_users = list(set(auctions["sender"].apply(lambda x: x.replace('0x','\\x'))))
-# all_users_string = "('" + "'),('".join(all_users) + "')"
-
 #need to string together txs based on hash + replacementHash, but this is a nested dict due to multiple speedups. 
 replaceHashKeys = dict(zip(auctions["replaceHash"],auctions["tx_hash"])) #assign tx_hash based on replacements, just to keep consistency. 
 replaceHashKeys.pop("none") #remove none key
@@ -60,6 +56,10 @@ auctions["tx_hash"] = auctions["tx_hash"].apply(lambda x: recursive_tx_search(x)
 ###removing some user outliers
 outliers = ["0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459","0x35632b6976b5b6ec3f8d700fabb7e1e0499c1bfa"] #these guys are super whales
 auctions = auctions[~auctions["sender"].isin(outliers)]
+
+# get full user list for dune query
+all_users = list(set(auctions["sender"].apply(lambda x: x.replace('0x','\\x'))))
+all_users_string = "('" + "'),('".join(all_users) + "')"
 
 """
 
@@ -180,10 +180,16 @@ k-means + tsne
 """
 from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans
+from sklearn import metrics
+
+import warnings
+warnings.simplefilter("ignore", UserWarning)
 import matplotlib.pyplot as plt
 import seaborn as sns
+import plotly.express as px
+from plotly.offline import plot
 
-def run_kmeans(df,clusters,projectId=None):
+def run_clustering(df,cluster_algo,projectId=None):
     """
     
     clusters and plots results for a given project    
@@ -195,62 +201,70 @@ def run_kmeans(df,clusters,projectId=None):
         raise ValueError("projectId does not exist in dataframe")
     else:
         df = df[df["projectId"]==projectId]
-        
-    # # implementing before tsne seems to not do well
-    # kmeans = KMeans(n_clusters=2)
-    # y_pred = kmeans.fit_predict(df) #can do features or PCA here. 
+    df = df.drop(columns="projectId")
         
     tsne = TSNE(n_components=2, verbose=0, perplexity=50, n_iter=300)
     tsne_results = tsne.fit_transform(df)
     df[["tsne_0","tsne_1"]] = tsne_results
-    
-    kmeans = KMeans(n_clusters=clusters)
-    y_pred = kmeans.fit_predict(df[["tsne_0","tsne_1"]]) #can do features or PCA here. 
+        
+    y_pred = cluster_algo.fit_predict(df[["tsne_0","tsne_1"]]) #can do features or PCA here. 
     merged_components=df
     merged_components["clusters"] = y_pred
-    
-    #elbow point, where decrease faster is better.    
-    inertia = []
-    for k in range(1, clusters):
-        kmeans = KMeans(n_clusters=k, random_state=1).fit(df[["tsne_0","tsne_1"]])
-        inertia.append(np.sqrt(kmeans.inertia_))
-        
-    plt.plot(range(1, clusters), inertia, marker='s');
-    plt.xlabel('$k$')
-    plt.ylabel('$J(C_k)$');
-    
-    # fig, ax = plt.subplots(figsize=(10,10))
-    # sns.scatterplot(data=merged_components, x="tsne_0",y="tsne_1",hue="clusters", ax=ax)
-    # ax.set(title="User Auction Behavior Groups Project {}".format(projectId))
-    
-    # #the following is more useful than pairplot for now
-    # merged_components_melt = merged_components.set_index("clusters", append=True).melt(ignore_index=False)
-    # merged_components_melt.reset_index(inplace=True, level=2)
-    # g = sns.FacetGrid(merged_components_melt, col="variable", hue="clusters", 
-    #                   sharey=False,sharex=False, col_wrap=5)
-    # g.map(sns.kdeplot, "value", shade=True)
-  
-    #get dict for return
+    merged_components["clusters"] = merged_components["clusters"].apply(lambda x: str(x))
     merged_components.reset_index(inplace=True)
+
+    # #elbow point, where decrease faster is better. 3 was best
+    # inertia = []
+    # for k in range(1, clusters):
+    #     cluster_algo = cluster_algo(n_clusters=k, random_state=1).fit(df[["tsne_0","tsne_1"]])
+    #     inertia.append(np.sqrt(kmeans.inertia_))   
+    # plt.plot(range(1, clusters), inertia, marker='s');
+    # plt.xlabel('$k$')
+    # plt.ylabel('$J(C_k)$');
+
+    print('Silhouette Score: ', metrics.silhouette_score(df[["tsne_0","tsne_1"]], cluster_algo.labels_))
+    
+    fig, ax = plt.subplots(figsize=(10,10))
+    sns.scatterplot(data=merged_components, x="tsne_0",y="tsne_1",hue="clusters", ax=ax)
+    ax.set(title="User Auction Behavior Groups Project {}".format(projectId))
+    
+    # fig = px.scatter(merged_components,x="tsne_0",y="tsne_1", color="clusters",hover_data=merged_components.columns)
+    # plot(fig,filename="kmeans_{}.html".format(projectId))
+    
+    # the following is more useful than pairplot for now
+    merged_components_melt = merged_components.set_index(["sender","ens","clusters"]).melt(ignore_index=False)
+    merged_components_melt.reset_index(inplace=True, level=2)
+    g = sns.FacetGrid(merged_components_melt, col="variable", hue="clusters", 
+                      sharey=False,sharex=False, col_wrap=5)
+    g.map(sns.kdeplot, "value", shade=True)
+    g.add_legend()
+
+    #get dict for return
     cluster_dict = dict(zip(merged_components.sender,merged_components.clusters))
     return cluster_dict
-
-
 
 def try_cluster(x, cluster_dict):
     if x in cluster_dict:
         return cluster_dict[x]
 
-bidders_df = auctions_all_df.reset_index()[["sender","ens"]].drop_duplicates()
+# this is for percentage cluster setup
+auctions_temp = auctions_all_df.copy()
+auctions_temp.reset_index(inplace=True)
+# bidders_progression_df = auctions_all_df.reset_index()[["sender","ens"]].drop_duplicates()
+
+cluster_algo = KMeans(n_clusters=3, random_state=42) #3 and 4 both look fine
 for projectId in auctions["projectId"].unique():
     print(projectId)
-    project_cluster_dict = run_kmeans(auctions_all_df,9,projectId)
+    project_cluster_dict = run_clustering(auctions_all_df,cluster_algo,projectId)
     column_name = "cluster_for_{}".format(projectId)
     
-    bidders_df[column_name] = bidders_df["sender"].apply(lambda x: try_cluster(x,project_cluster_dict))
+    # bidders_progression_df[column_name] = bidders_progression_df["sender"].apply(lambda x: try_cluster(x,project_cluster_dict))
+    auctions_temp[column_name] = auctions_temp["sender"].apply(lambda x: try_cluster(x, project_cluster_dict))
 
-# bidders_df.set_index(["sender","ens"], inplace=True)
-# bidders_df.dropna(inplace=True)
+#get percentage failed per cluster for each project
+percentage_cluster = auctions_temp[auctions_temp["projectId"]==118].pivot_table(index="cluster_for_118",values=["number_submitted","failed","confirmed","cancel"],aggfunc="sum")
+percentage_cluster["percent_failed"] = (percentage_cluster["cancel"] + percentage_cluster["failed"])/percentage_cluster["number_submitted"]
+percentage_cluster["percent_confirmed"] = percentage_cluster["confirmed"]/percentage_cluster["number_submitted"]
 
 # @todo: add heatmap corr matrix, to see clusters relationships with variables. 
 # this is probably good for comparing across auctions maybe, show their cluster across variables. 
