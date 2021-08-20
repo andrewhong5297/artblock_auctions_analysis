@@ -8,8 +8,6 @@ SELECT "projectId", count("status") mints FROM artblocks_mints_expanded
 WHERE "status"='confirmed'
 GROUP BY 1
 ORDER BY mints DESC
-
-we can reasonably use projects 118, 133, 137, 110, and maybe 131. Others don't have enough data
 """
 
 import pandas as pd
@@ -23,37 +21,29 @@ preprocessing auction data
 """
 #will need to do something special for dutch versus normal auctions later... maybe can just be a dummy var flag for now. 
 auctions = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/auctions_818.csv')
-projects_keep = [118,110,133,137,131]
+projects_keep = [118,110,133]
 auctions = auctions[auctions["projectId"].isin(projects_keep)]
 
 auctions = auctions[auctions["blocknumber"]!=0] #@todo: delete dropped, figure out how to deal with this issue later. 
-
-to_remove_indicies = []
-for project in list(set(auctions["projectId"])):
-    #check for outliers
-    auction_spec = auctions[auctions["projectId"]==project]
-    all_times = pd.Series(list(set(auction_spec.blocknumber)))
-    to_remove_blocktimes = all_times[(np.abs(stats.zscore(all_times)) > 2)] #remove values more than 2 std dev of time away. likely not part of main auction time
-    if len(to_remove_blocktimes)==0:
-        break
-    
-    to_remove_indicies.extend(auction_spec.index[auction_spec['blocknumber'].isin(to_remove_blocktimes)].tolist())
-
-auctions.drop(index=to_remove_indicies, inplace=True)
-
 auctions["sender"] = auctions["sender"].apply(lambda x: x.lower())
 auctions["gas_eth"] = auctions["gas_limit"]*auctions["gas_price"]
 auctions["timestamp"] = pd.to_datetime(auctions["timestamp"])
 auctions["timestamp"] = auctions["timestamp"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M:%S")) #reduce to seconds granularity instead for plotting reasons
 
-# # get full user list
+#check for outliers in mint time, to remove those that were minted way before or after the auction.
+to_remove_indicies = []
+for project in list(set(auctions["projectId"])):
+    auction_spec = auctions[auctions["projectId"]==project]
+    all_times = pd.Series(list(set(auction_spec.blocknumber)))
+    to_remove_blocktimes = all_times[(np.abs(stats.zscore(all_times)) > 2)] #remove values more than 2 std dev of time away. likely not part of main auction time
+    if len(to_remove_blocktimes)==0:
+        break
+    to_remove_indicies.extend(auction_spec.index[auction_spec['blocknumber'].isin(to_remove_blocktimes)].tolist())
+auctions.drop(index=to_remove_indicies, inplace=True)
+
+# # get full user list for dune query
 # all_users = list(set(auctions["sender"].apply(lambda x: x.replace('0x','\\x'))))
 # all_users_string = "('" + "'),('".join(all_users) + "')"
-
-# #for sanity check stuff only
-# test_df = auctions[auctions["sender"]=="0xcbf3C9b38003fa550A7bfF5206366c1f62480bA7"]
-# replaceHashKeysT = dict(zip(test_df["replaceHash"],test_df["tx_hash"])) #assign tx_hash based on replacements, just to keep consistency. 
-# replaceHashKeysT.pop("none") #remove none key
 
 #need to string together txs based on hash + replacementHash, but this is a nested dict due to multiple speedups. 
 replaceHashKeys = dict(zip(auctions["replaceHash"],auctions["tx_hash"])) #assign tx_hash based on replacements, just to keep consistency. 
@@ -65,14 +55,7 @@ def recursive_tx_search(key):
     else:
         return key
 
-def try_replace_root_tx(x):
-    try:
-        # we need to recursively call the dictionary to find the root hash, since many actions will drop the original and replace it
-        return recursive_tx_search(x)
-    except:
-        return x
-
-auctions["tx_hash"] = auctions["tx_hash"].apply(lambda x: try_replace_root_tx(x))
+auctions["tx_hash"] = auctions["tx_hash"].apply(lambda x: recursive_tx_search(x))
 
 ###removing some user outliers
 outliers = ["0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459","0x35632b6976b5b6ec3f8d700fabb7e1e0499c1bfa"] #these guys are super whales
@@ -80,64 +63,14 @@ auctions = auctions[~auctions["sender"].isin(outliers)]
 
 """
 
-feature engineering by auction (may be a way to do cumulative later)
+feature engineering by auction
 
 """
-# @todo: replace with for loop later
-# just concat each dataframe. Then could pivot table with count for projects, sum for states, averages for the rest of the metrics, 
-# and a column for each project and their cluster position
-
-# for project in auctions["projectId"].unique():
-
-auctions = auctions[auctions["projectId"]==118]
-
-###@feature: calculate basic auction stats
-user_state_pivot = auctions.pivot_table(index=["sender"], columns="status",values="gas_eth", aggfunc="count")
-user_state_pivot.fillna(0, inplace=True)
-
-#filter out dropped, maybe come fix later but this is only like 6 txs out of thousands. 
-user_state_pivot = user_state_pivot[~user_state_pivot[["cancel","confirmed","failed"]].eq(0).all(1)] 
-user_state_pivot.drop(columns="pending", inplace=True)
-user_number_submitted = auctions.pivot_table(index="sender", values="tx_hash", aggfunc=lambda x: len(x.unique()))
-user_number_submitted.columns = ["number_submitted"]
-
-
-###@feature: calculate avg gas per block difference between pending/speedup and confirmed. shift by 1 since it is pending for next block
-gas_activity = auctions.pivot_table(index="sender", columns="blocknumber",values="gas_eth", aggfunc="mean") \
-                .reindex(set(auctions["blocknumber"]), axis=1, fill_value=np.nan)
-gas_activity = gas_activity.T.reset_index().sort_values(by="blocknumber",ascending=True).set_index("blocknumber").T
-
-def fill_pending_values(x):
+def fill_pending_values_gas(x):
     first = x.first_valid_index()
     last = x.last_valid_index()
     x.loc[first:last] = x.loc[first:last].fillna(method="ffill")
     return x
-
-gas_activity = gas_activity.apply(lambda x: fill_pending_values(x), axis=1)
-
-gas_needed = auctions[auctions["status"]=="confirmed"].pivot_table(columns="blocknumber",values="gas_eth", aggfunc="mean") \
-                    .reindex(set(auctions["blocknumber"]), axis=1, fill_value=np.nan)
-gas_needed = gas_needed.T.reset_index().sort_values(by="blocknumber",ascending=True).set_index("blocknumber")
-gas_needed = gas_needed.fillna(method="backfill").fillna(method="ffill")
-gas_needed = gas_needed.T
-
-for number in gas_needed.columns:
-    gas_activity[number] = gas_activity[number] - gas_needed[number][0] #positive is extra gas, negative is missing gas
-
-gas_activity["average_gas_behavior"] = gas_activity.mean(axis=1)
-gas_activity["median_gas_behavior"] = gas_activity.iloc[:,:-1].median(axis=1)
-gas_activity["stdev_gas_behavior"] = gas_activity.iloc[:,:-2].std(axis=1)
-gas_activity["stdev_gas_behavior"].fillna(0,inplace=True) #no stdev for if only one block pending
-
-###@feature: getting time diff per row. Not sure if there is a way to map this across all rows. 
-get_first_pending = auctions[auctions["status"]=="pending"] #first submitted 
-get_first_pending = get_first_pending.drop_duplicates(subset=["tx_hash","status"], keep="first")
-auctions_time_data = pd.concat([get_first_pending,auctions[auctions["status"]=="speedup"]], axis=0)
-time_action = auctions_time_data.pivot_table(index=["sender","tx_hash"], columns="blocknumber",values="status",aggfunc="count") \
-                .reindex(set(auctions["blocknumber"]), axis=1, fill_value=np.nan)
-
-sorting_blocknumber_columns = time_action.columns.sort_values(ascending=True)
-time_action = time_action[sorting_blocknumber_columns]
 
 def get_actions_diff(row):
     row = row.dropna().reset_index()
@@ -152,18 +85,79 @@ def get_actions_diff(row):
     else:
         return actions_diff
 
-row = time_action.iloc[1,:]
-time_action["average_action_delay"] = time_action.apply(lambda x: get_actions_diff(x),axis=1)
-time_action["total_actions"] = time_action.iloc[:,:-1].sum(axis=1)
+def preprocess_auction(df, projectId):
+    """
+    
+    creates all the features for auction analysis. Could definitely be refactored 
+    
+    """
+    if projectId not in df["projectId"].unique():
+        raise ValueError("projectId does not exist in dataframe")
+        
+    df = df[df["projectId"]==projectId]
+    
+    ###@feature: calculate basic auction stats
+    user_state_pivot = df.pivot_table(index=["sender"], columns="status",values="gas_eth", aggfunc="count")
+    user_state_pivot.fillna(0, inplace=True)
+    user_state_pivot = user_state_pivot[~user_state_pivot[["cancel","confirmed","failed"]].eq(0).all(1)] #filter out dropped, maybe come fix later but this is only like 6 txs out of thousands. 
+    user_state_pivot.drop(columns="pending", inplace=True)
+    user_number_submitted = df.pivot_table(index="sender", values="tx_hash", aggfunc=lambda x: len(x.unique()))
+    user_number_submitted.columns = ["number_submitted"]
+    user_number_submitted.fillna(0,inplace=True) #@todo: this is not ideal, but I think there was missing data due to EIP1559 capture errors. 
+    
+    ###@feature: calculate avg gas per block difference between pending/speedup and confirmed. shift by 1 since it is pending for next block
+    gas_activity = df.pivot_table(index="sender", columns="blocknumber",values="gas_eth", aggfunc="mean") \
+                    .reindex(set(df["blocknumber"]), axis=1, fill_value=np.nan)
+    gas_activity = gas_activity.T.reset_index().sort_values(by="blocknumber",ascending=True).set_index("blocknumber").T
+    
+    gas_activity = gas_activity.apply(lambda x: fill_pending_values_gas(x), axis=1)
+    
+    gas_needed = df[df["status"]=="confirmed"].pivot_table(columns="blocknumber",values="gas_eth", aggfunc="mean") \
+                        .reindex(set(df["blocknumber"]), axis=1, fill_value=np.nan)
+    gas_needed = gas_needed.T.reset_index().sort_values(by="blocknumber",ascending=True).set_index("blocknumber")
+    gas_needed = gas_needed.fillna(method="backfill").fillna(method="ffill")
+    gas_needed = gas_needed.T
+    
+    for number in gas_needed.columns:
+        gas_activity[number] = gas_activity[number] - gas_needed[number][0] #positive is extra gas, negative is missing gas
+    
+    gas_activity["average_gas_behavior"] = gas_activity.mean(axis=1)
+    gas_activity["median_gas_behavior"] = gas_activity.iloc[:,:-1].median(axis=1)
+    gas_activity["stdev_gas_behavior"] = gas_activity.iloc[:,:-2].std(axis=1)
+    gas_activity["stdev_gas_behavior"].fillna(0,inplace=True) #no stdev for if only one block pending
+    
+    ###@feature: getting time diff per row. Not sure if there is a way to map this across all rows. 
+    get_first_pending = df[df["status"]=="pending"] #first submitted 
+    get_first_pending = get_first_pending.drop_duplicates(subset=["tx_hash","status"], keep="first")
+    auctions_time_data = pd.concat([get_first_pending,df[df["status"]=="speedup"]], axis=0)
+    time_action = auctions_time_data.pivot_table(index=["sender","tx_hash"], columns="blocknumber",values="status",aggfunc="count") \
+                    .reindex(set(df["blocknumber"]), axis=1, fill_value=np.nan)
+    
+    sorting_blocknumber_columns = time_action.columns.sort_values(ascending=True)
+    time_action = time_action[sorting_blocknumber_columns]
+    
+    row = time_action.iloc[1,:]
+    time_action["average_action_delay"] = time_action.apply(lambda x: get_actions_diff(x),axis=1)
+    time_action["total_actions"] = time_action.iloc[:,:-1].sum(axis=1)
+    time_action["average_action_delay"].fillna(5000,inplace=True)
+    time_action["total_actions"].fillna(0,inplace=True)
 
-#pivot a final time by sender, without tx_hash and using only average_action_delay.
-users_actions = time_action.reset_index().pivot_table(index="sender",values=["total_actions","average_action_delay"], 
-                                                      aggfunc={"total_actions":"sum","average_action_delay":"mean"})
+    #pivot a final time by sender, without tx_hash and using only average_action_delay.
+    users_actions = time_action.reset_index().pivot_table(index="sender",values=["total_actions","average_action_delay"], 
+                                                          aggfunc={"total_actions":"sum","average_action_delay":"mean"})
+    
+    user_state_featurized = pd.merge(user_number_submitted.reset_index(),user_state_pivot.reset_index(),on="sender",how="outer")
+    user_state_featurized = pd.merge(user_state_featurized,gas_activity[["average_gas_behavior","stdev_gas_behavior","median_gas_behavior"]].reset_index(),on="sender",how="outer")
+    user_state_featurized = pd.merge(user_state_featurized,users_actions[["average_action_delay","total_actions"]].reset_index(),on="sender",how="outer")
+    user_state_featurized["projectId"] = projectId
+    return user_state_featurized
 
-#deal with some nans
-user_state_featurized = pd.merge(user_number_submitted.reset_index(),user_state_pivot.reset_index(),on="sender",how="outer")
-user_state_featurized = pd.merge(user_state_featurized,gas_activity[["average_gas_behavior","stdev_gas_behavior","median_gas_behavior"]].reset_index(),on="sender",how="outer")
-user_state_featurized = pd.merge(user_state_featurized,users_actions[["average_action_delay","total_actions"]].reset_index(),on="sender",how="outer")
+auctions_all = []
+for projectId in auctions["projectId"].unique():
+    print("calculating for: ", projectId)
+    auctions_all.append(preprocess_auction(auctions, projectId))
+    
+auctions_all_df = pd.concat(auctions_all)
 
 """appending user wallet data"""
 #there are 889 users out of 3385 who have an ENS registered on Ethereum. 
@@ -175,36 +169,111 @@ wh = wh.rename(columns={'user_address':'sender'})
 wh["time_since_first_tx"] = wh["time_since_first_tx"].apply(lambda x: "0" if x == "00:00:00" else x)
 wh["time_since_first_tx"]=wh["time_since_first_tx"].apply(lambda x: int(x.split(" ")[0]))
 
-user_state_featurized = pd.merge(user_state_featurized,wh,on="sender",how="outer")
-user_state_featurized.set_index(["sender","ens"],inplace=True)
-user_state_featurized.dropna(inplace=True) #shouldn't need this after
+auctions_all_df = pd.merge(auctions_all_df,wh,on="sender",how="outer")
+auctions_all_df.set_index(["sender","ens"],inplace=True)
+auctions_all_df.dropna(inplace=True)
 
-"""PCA and k-means"""
-from sklearn.decomposition import PCA
+"""
+
+k-means + tsne
+
+"""
 from sklearn.manifold import TSNE
+from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-pca = PCA(n_components=10)
-principalComponents = pca.fit_transform(user_state_featurized) #replace with cosine or clust_df
+def run_kmeans(df,clusters,projectId=None):
+    """
+    
+    clusters and plots results for a given project    
+    
+    """
+    if projectId == None:
+        pass
+    elif projectId not in df["projectId"].unique():
+        raise ValueError("projectId does not exist in dataframe")
+    else:
+        df = df[df["projectId"]==projectId]
+        
+    # # implementing before tsne seems to not do well
+    # kmeans = KMeans(n_clusters=2)
+    # y_pred = kmeans.fit_predict(df) #can do features or PCA here. 
+        
+    tsne = TSNE(n_components=2, verbose=0, perplexity=50, n_iter=300)
+    tsne_results = tsne.fit_transform(df)
+    df[["tsne_0","tsne_1"]] = tsne_results
+    
+    kmeans = KMeans(n_clusters=clusters)
+    y_pred = kmeans.fit_predict(df[["tsne_0","tsne_1"]]) #can do features or PCA here. 
+    merged_components=df
+    merged_components["clusters"] = y_pred
+    
+    #elbow point, where decrease faster is better.    
+    inertia = []
+    for k in range(1, clusters):
+        kmeans = KMeans(n_clusters=k, random_state=1).fit(df[["tsne_0","tsne_1"]])
+        inertia.append(np.sqrt(kmeans.inertia_))
+        
+    plt.plot(range(1, clusters), inertia, marker='s');
+    plt.xlabel('$k$')
+    plt.ylabel('$J(C_k)$');
+    
+    # fig, ax = plt.subplots(figsize=(10,10))
+    # sns.scatterplot(data=merged_components, x="tsne_0",y="tsne_1",hue="clusters", ax=ax)
+    # ax.set(title="User Auction Behavior Groups Project {}".format(projectId))
+    
+    # #the following is more useful than pairplot for now
+    # merged_components_melt = merged_components.set_index("clusters", append=True).melt(ignore_index=False)
+    # merged_components_melt.reset_index(inplace=True, level=2)
+    # g = sns.FacetGrid(merged_components_melt, col="variable", hue="clusters", 
+    #                   sharey=False,sharex=False, col_wrap=5)
+    # g.map(sns.kdeplot, "value", shade=True)
+  
+    #get dict for return
+    merged_components.reset_index(inplace=True)
+    cluster_dict = dict(zip(merged_components.sender,merged_components.clusters))
+    return cluster_dict
 
-PCA_components = pd.DataFrame(principalComponents)
 
-from sklearn.cluster import KMeans
-kmeans = KMeans(n_clusters=2)
-y_pred = kmeans.fit_predict(user_state_featurized) #can do features or PCA here. 
 
-###@todo: need to do silhouette and other factors to assess best kmeans
+def try_cluster(x, cluster_dict):
+    if x in cluster_dict:
+        return cluster_dict[x]
 
-tsne = TSNE(n_components=2, verbose=1, perplexity=50, n_iter=300)
-tsne_results = tsne.fit_transform(user_state_featurized)
-user_state_featurized[["tsne_0","tsne_1"]] = tsne_results
-merged_components=user_state_featurized
-merged_components["clusters"] = y_pred
+bidders_df = auctions_all_df.reset_index()[["sender","ens"]].drop_duplicates()
+for projectId in auctions["projectId"].unique():
+    print(projectId)
+    project_cluster_dict = run_kmeans(auctions_all_df,9,projectId)
+    column_name = "cluster_for_{}".format(projectId)
+    
+    bidders_df[column_name] = bidders_df["sender"].apply(lambda x: try_cluster(x,project_cluster_dict))
 
-fig, ax = plt.subplots(figsize=(10,10))
-sns.scatterplot(data=merged_components, x="tsne_0",y="tsne_1",hue="clusters", ax=ax)
-ax.set(title="User Auction Behavior Groups")
+# bidders_df.set_index(["sender","ens"], inplace=True)
+# bidders_df.dropna(inplace=True)
+
+# @todo: add heatmap corr matrix, to see clusters relationships with variables. 
+# this is probably good for comparing across auctions maybe, show their cluster across variables. 
+# show main gas/action variables across auctions and also other variables? 
+
+# # need to specify x and y cols better here before use
+# sns.pairplot(data=merged_components, height=3, hue="clusters", kind="scatter")
+
+"""graveyard"""
+###putting all epochs together does nothing lol
+# final_auctions_df = auctions_all_df.pivot_table(index=auctions_all_df.index,values=auctions_all_df.columns,
+#                                                 aggfunc={"number_submitted":"sum","cancel":"sum","confirmed":"sum","failed":"sum","speedup":"sum",
+#                                                          "average_gas_behavior":"mean","stdev_gas_behavior":"mean","median_gas_behavior":"mean",
+#                                                          "average_action_delay":"mean","total_actions":"mean","projectId":"count",
+#                                                          "time_since_first_tx":"mean","total_gas_eth":"mean","number_of_txs":"mean"})
+
+# final_df = run_kmeans(final_auctions_df)
+
+###PCA not useful here
+# from sklearn.decomposition import PCA
+# pca = PCA(n_components=10)
+# principalComponents = pca.fit_transform(user_state_featurized) #replace with cosine or clust_df
+# PCA_components = pd.DataFrame(principalComponents)
 
 # PCA_components["clusters"] = y_pred
 # PCA_components[["sender","ens"]]= user_state_featurized.reset_index()[["sender","ens"]]
@@ -217,21 +286,7 @@ ax.set(title="User Auction Behavior Groups")
 # sns.scatterplot(data=merged_components, x="PCA_0",y="PCA_1",hue="clusters", ax=ax)
 # ax.set(title="User Auction Behavior Groups")
 
-#the following is more useful than pairplot for now
-merged_components_melt = merged_components.set_index("clusters", append=True).melt(ignore_index=False)
-merged_components_melt.reset_index(inplace=True, level=2)
-g = sns.FacetGrid(merged_components_melt, col="variable", hue="clusters", 
-                  sharey=False,sharex=False, col_wrap=5)
-g.map(sns.kdeplot, "value", shade=True)
-
-# @todo: add heatmap stuff corr matrix?
-# this is probably good for comparing across auctions maybe, show their cluster across variables. 
-# show main gas/action variables across auctions and also other variables? 
-
-# # need to specify x and y cols better here before use
-# sns.pairplot(data=merged_components, height=3, hue="clusters", kind="scatter")
-
-"""histogram of an auction over time"""
+"""histogram of an auction over time, used for that one tweet only"""
 # import seaborn as sns
 # import matplotlib.pyplot as plt
 # histogram_pivot = auctions.pivot_table(index=["blocknumber","tx_hash"],columns="status",values="gas_eth", aggfunc="mean")
