@@ -22,7 +22,7 @@ preprocessing auction data
 """
 #will need to do something special for dutch versus normal auctions later... maybe can just be a dummy var flag for now. 
 auctions = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/auctions_820.csv')
-projects_keep = [118] #,133,110,131,143]
+projects_keep = [118,133,110]#,131,143,140]
 auctions = auctions[auctions["projectId"].isin(projects_keep)]
 
 auctions["sender"] = auctions["sender"].apply(lambda x: x.lower())
@@ -53,16 +53,16 @@ auctions["tx_hash"] = auctions["tx_hash"].apply(lambda x: recursive_tx_search(x)
 outliers = ["0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459","0x35632b6976b5b6ec3f8d700fabb7e1e0499c1bfa"] #these guys are super whales
 auctions = auctions[~auctions["sender"].isin(outliers)]
 
-# #check for outliers in mint time, to remove those that were minted way before or after the auction.
-# to_remove_indicies = []
-# for project in list(set(auctions["projectId"])):
-#     auction_spec = auctions[auctions["projectId"]==project]
-#     all_times = pd.Series(list(set(auction_spec.blocknumber)))
-#     to_remove_blocktimes = all_times[(np.abs(stats.zscore(all_times)) > 2)] #remove values more than 2 std dev of time away. likely not part of main auction time
-#     if len(to_remove_blocktimes)==0:
-#         break
-#     to_remove_indicies.extend(auction_spec.index[auction_spec['blocknumber'].isin(to_remove_blocktimes)].tolist())
-# auctions.drop(index=to_remove_indicies, inplace=True)
+#check for outliers in mint time, to remove those that were minted way before or after the auction.
+to_remove_indicies = []
+for project in list(set(auctions["projectId"])):
+    auction_spec = auctions[auctions["projectId"]==project]
+    all_times = pd.Series(list(set(auction_spec.blocknumber)))
+    to_remove_blocktimes = all_times[(np.abs(stats.zscore(all_times)) > 2.5)] #remove values more than 2 std dev of time away. likely not part of main auction time
+    if len(to_remove_blocktimes)==0:
+        break
+    to_remove_indicies.extend(auction_spec.index[auction_spec['blocknumber'].isin(to_remove_blocktimes)].tolist())
+auctions.drop(index=to_remove_indicies, inplace=True)
 
 # get full user list for dune query
 all_users = list(set(auctions["sender"].apply(lambda x: x.replace('0x','\\x'))))
@@ -107,10 +107,7 @@ def preprocess_auction(df, projectId):
     user_state_pivot = df.pivot_table(index=["sender"], columns="status",values="gas_eth", aggfunc="count")
     user_state_pivot.fillna(0, inplace=True)
     
-    #@todo: compare how many missing out of total txs
     print("number users with missing outcomes {}/{}".format(user_state_pivot[user_state_pivot[["cancel","confirmed","failed"]].eq(0).all(1)].shape[0],user_state_pivot.shape[0]))
-    user_state_pivot = user_state_pivot[~user_state_pivot[["cancel","confirmed","failed"]].eq(0).all(1)] #filter out those with no results
-
     user_state_pivot.drop(columns="pending", inplace=True)
     user_number_submitted = df.pivot_table(index="sender", values="tx_hash", aggfunc=lambda x: len(x.unique()))
     user_number_submitted.columns = ["number_submitted"]
@@ -148,18 +145,26 @@ def preprocess_auction(df, projectId):
     
     time_action["average_action_delay"] = time_action.apply(lambda x: get_actions_diff(x),axis=1)
     time_action["total_actions"] = time_action.iloc[:,:-1].sum(axis=1)
-
+    
     #pivot a final time by sender agg by tx_hash
     users_actions = time_action.reset_index().pivot_table(index="sender",values=["total_actions","average_action_delay"], 
                                                           aggfunc={"total_actions":"sum","average_action_delay":"mean"})
+    
+    #get time of participation
+    get_first_pending["block_entry"] = get_first_pending["blocknumber"] - get_first_pending["blocknumber"].min()
+    entry_pivot = get_first_pending.pivot_table(index="sender",values="block_entry",aggfunc="min")
     
     #merge all features together
     user_state_featurized = pd.merge(user_number_submitted.reset_index(),user_state_pivot.reset_index(),on="sender",how="outer")
     user_state_featurized.fillna(0,inplace=True) #@todo: this is not ideal, but I think there is a little bit of missing data due to EIP1559 capture errors. 
     user_state_featurized = pd.merge(user_state_featurized,gas_activity[["average_gas_behavior","stdev_gas_behavior","median_gas_behavior"]].reset_index(),on="sender",how="outer")
     user_state_featurized = pd.merge(user_state_featurized,users_actions[["average_action_delay","total_actions"]].reset_index(),on="sender",how="outer")
+    user_state_featurized = pd.merge(user_state_featurized,entry_pivot["block_entry"].reset_index(),on="sender",how="right") #@todo drop users who pending missing
     user_state_featurized["projectId"] = projectId #create projectId column
     return user_state_featurized
+
+projectId=118
+df = auctions
 
 auctions_all = []
 for projectId in auctions["projectId"].unique():
@@ -170,6 +175,7 @@ auctions_all_df = pd.concat(auctions_all)
 auctions_all_df["average_action_delay"].fillna(2000,inplace=True) #fill default for 0 actions taken
 auctions_all_df["total_actions"].fillna(0,inplace=True) #fill default for 0 actions taken
 auctions_all_df["dropped"].fillna(0,inplace=True) #some auctions had 0 dropped so then shows up as nan after concat
+auctions_all_df = auctions_all_df[~auctions_all_df[["cancel","confirmed","failed","dropped"]].eq(0).all(1)] #filter out those with no results
 
 """appending user wallet data"""
 #there are 889 users out of 3385 who have an ENS registered on Ethereum. 
@@ -238,19 +244,22 @@ def run_clustering(df,cluster_algo,projectId=None,seed=42):
     fig, ax = plt.subplots(figsize=(10,10))
     sns.scatterplot(data=merged_components, x="tsne_0",y="tsne_1",hue="clusters", ax=ax)
     ax.set(title="User Auction Behavior Groups Project {}".format(projectId))
-    
-    # boxplot of average_action_delay and average_gas_behavior
-    sns.boxplot(x=merged_components["clusters"],y=merged_components["average_action_delay"], title="{}")
-    sns.boxplot(x=merged_components["clusters"],y=merged_components["average_gas_behavior"], title="{}")
 
-    # # Density plot
-    # merged_components_melt = merged_components.set_index(["sender","ens","clusters"]).melt(ignore_index=False)
-    # merged_components_melt.reset_index(inplace=True, level=2)
-    # g = sns.FacetGrid(merged_components_melt, col="variable", hue="clusters", 
-    #                   sharey=False,sharex=False, col_wrap=5)
-    # g.map(sns.kdeplot, "value", shade=True)
-    # g.add_legend()
+    # Density plot
+    merged_components_melt = merged_components.set_index(["sender","ens","clusters"]).melt(ignore_index=False)
+    merged_components_melt.reset_index(inplace=True, level=2)
+    g = sns.FacetGrid(merged_components_melt, col="variable", hue="clusters", 
+                      sharey=False,sharex=False, col_wrap=5)
+    g.map(sns.kdeplot, "value", shade=True)
+    g.add_legend()
     
+    # # boxplot of average_action_delay and average_gas_behavior
+    # fig2, ax2 = plt.subplots(figsize=(10,10)) 
+    # sns.boxplot(x=merged_components["clusters"],y=merged_components["average_action_delay"], ax=ax2)
+    
+    # fig3, ax3 = plt.subplots(figsize=(10,10)) 
+    # sns.boxplot(x=merged_components["clusters"],y=merged_components["average_gas_behavior"], ax=ax3)
+
     # #plotly
     # fig = px.scatter(merged_components,x="tsne_0",y="tsne_1", color="clusters",hover_data=merged_components.columns)
     # plot(fig,filename="kmeans_{}.html".format(projectId))
