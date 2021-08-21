@@ -13,6 +13,7 @@ ORDER BY mints DESC
 import pandas as pd
 import numpy as np
 from scipy import stats
+import datetime
 
 """
 
@@ -20,26 +21,17 @@ preprocessing auction data
 
 """
 #will need to do something special for dutch versus normal auctions later... maybe can just be a dummy var flag for now. 
-auctions = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/auctions_818.csv')
-projects_keep = [118,110,133]
+auctions = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/auctions_820.csv')
+projects_keep = [118] #,133,110,131,143]
 auctions = auctions[auctions["projectId"].isin(projects_keep)]
 
-auctions = auctions[auctions["blocknumber"]!=0] #@todo: delete dropped, figure out how to deal with this issue later. 
 auctions["sender"] = auctions["sender"].apply(lambda x: x.lower())
 auctions["gas_eth"] = auctions["gas_limit"]*auctions["gas_price"]
 auctions["timestamp"] = pd.to_datetime(auctions["timestamp"])
 auctions["timestamp"] = auctions["timestamp"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M:%S")) #reduce to seconds granularity instead for plotting reasons
 
-#check for outliers in mint time, to remove those that were minted way before or after the auction.
-to_remove_indicies = []
-for project in list(set(auctions["projectId"])):
-    auction_spec = auctions[auctions["projectId"]==project]
-    all_times = pd.Series(list(set(auction_spec.blocknumber)))
-    to_remove_blocktimes = all_times[(np.abs(stats.zscore(all_times)) > 2)] #remove values more than 2 std dev of time away. likely not part of main auction time
-    if len(to_remove_blocktimes)==0:
-        break
-    to_remove_indicies.extend(auction_spec.index[auction_spec['blocknumber'].isin(to_remove_blocktimes)].tolist())
-auctions.drop(index=to_remove_indicies, inplace=True)
+auctions = auctions.sort_values(by="timestamp",ascending=True)
+auctions["blocknumber"] = auctions["blocknumber"].replace(to_replace=0, method='bfill') #deal with dropped txs that show as blocknumber 0
 
 #need to string together txs based on hash + replacementHash, but this is a nested dict due to multiple speedups. 
 replaceHashKeys = dict(zip(auctions["replaceHash"],auctions["tx_hash"])) #assign tx_hash based on replacements, just to keep consistency. 
@@ -53,9 +45,24 @@ def recursive_tx_search(key):
 
 auctions["tx_hash"] = auctions["tx_hash"].apply(lambda x: recursive_tx_search(x))
 
+# #debugging, I think missing txs were due to wifi and overload issues
+# user_state_pivot = auctions[auctions["projectId"]==143].pivot_table(index=["sender","tx_hash"], columns="status",values="gas_eth", aggfunc="count")
+# user_state_pivot.fillna(0, inplace=True)
+
 ###removing some user outliers
 outliers = ["0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459","0x35632b6976b5b6ec3f8d700fabb7e1e0499c1bfa"] #these guys are super whales
 auctions = auctions[~auctions["sender"].isin(outliers)]
+
+# #check for outliers in mint time, to remove those that were minted way before or after the auction.
+# to_remove_indicies = []
+# for project in list(set(auctions["projectId"])):
+#     auction_spec = auctions[auctions["projectId"]==project]
+#     all_times = pd.Series(list(set(auction_spec.blocknumber)))
+#     to_remove_blocktimes = all_times[(np.abs(stats.zscore(all_times)) > 2)] #remove values more than 2 std dev of time away. likely not part of main auction time
+#     if len(to_remove_blocktimes)==0:
+#         break
+#     to_remove_indicies.extend(auction_spec.index[auction_spec['blocknumber'].isin(to_remove_blocktimes)].tolist())
+# auctions.drop(index=to_remove_indicies, inplace=True)
 
 # get full user list for dune query
 all_users = list(set(auctions["sender"].apply(lambda x: x.replace('0x','\\x'))))
@@ -81,7 +88,7 @@ def get_actions_diff(row):
     actions_diff_nominal.extend(list(np.zeros(int(zeros_to_add))))
     actions_diff = np.mean(actions_diff_nominal)
     if (actions_diff==0) and (zeros_to_add==0):
-        return 5000 #meaning they never took another action
+        return 2000 #meaning they never took another action
     else:
         return actions_diff
 
@@ -96,16 +103,19 @@ def preprocess_auction(df, projectId):
         
     df = df[df["projectId"]==projectId]
     
-    ###@feature: calculate basic auction stats
+    ##@feature: calculate basic auction stats
     user_state_pivot = df.pivot_table(index=["sender"], columns="status",values="gas_eth", aggfunc="count")
     user_state_pivot.fillna(0, inplace=True)
-    user_state_pivot = user_state_pivot[~user_state_pivot[["cancel","confirmed","failed"]].eq(0).all(1)] #filter out dropped, maybe come fix later but this is only like 6 txs out of thousands. 
+    
+    #@todo: compare how many missing out of total txs
+    print("number users with missing outcomes {}/{}".format(user_state_pivot[user_state_pivot[["cancel","confirmed","failed"]].eq(0).all(1)].shape[0],user_state_pivot.shape[0]))
+    user_state_pivot = user_state_pivot[~user_state_pivot[["cancel","confirmed","failed"]].eq(0).all(1)] #filter out those with no results
+
     user_state_pivot.drop(columns="pending", inplace=True)
     user_number_submitted = df.pivot_table(index="sender", values="tx_hash", aggfunc=lambda x: len(x.unique()))
     user_number_submitted.columns = ["number_submitted"]
-    user_number_submitted.fillna(0,inplace=True) #@todo: this is not ideal, but I think there was missing data due to EIP1559 capture errors. 
-    
-    ###@feature: calculate avg gas per block difference between pending/speedup and confirmed. shift by 1 since it is pending for next block
+
+    ##@feature: calculate avg gas per block difference between pending/speedup and confirmed. shift by 1 since it is pending for next block
     gas_activity = df.pivot_table(index="sender", columns="blocknumber",values="gas_eth", aggfunc="mean") \
                     .reindex(set(df["blocknumber"]), axis=1, fill_value=np.nan)
     gas_activity = gas_activity.T.reset_index().sort_values(by="blocknumber",ascending=True).set_index("blocknumber").T
@@ -126,7 +136,7 @@ def preprocess_auction(df, projectId):
     gas_activity["stdev_gas_behavior"] = gas_activity.iloc[:,:-2].std(axis=1)
     gas_activity["stdev_gas_behavior"].fillna(0,inplace=True) #no stdev for if only one block pending
     
-    ###@feature: getting time diff per row. Not sure if there is a way to map this across all rows. 
+    ##@feature: getting time diff per row. Not sure if there is a way to map this across all rows. 
     get_first_pending = df[df["status"]=="pending"] #first submitted 
     get_first_pending = get_first_pending.drop_duplicates(subset=["tx_hash","status"], keep="first")
     auctions_time_data = pd.concat([get_first_pending,df[df["status"]=="speedup"]], axis=0)
@@ -136,28 +146,30 @@ def preprocess_auction(df, projectId):
     sorting_blocknumber_columns = time_action.columns.sort_values(ascending=True)
     time_action = time_action[sorting_blocknumber_columns]
     
-    row = time_action.iloc[1,:]
     time_action["average_action_delay"] = time_action.apply(lambda x: get_actions_diff(x),axis=1)
     time_action["total_actions"] = time_action.iloc[:,:-1].sum(axis=1)
-    time_action["average_action_delay"].fillna(5000,inplace=True)
-    time_action["total_actions"].fillna(0,inplace=True)
 
-    #pivot a final time by sender, without tx_hash and using only average_action_delay.
+    #pivot a final time by sender agg by tx_hash
     users_actions = time_action.reset_index().pivot_table(index="sender",values=["total_actions","average_action_delay"], 
                                                           aggfunc={"total_actions":"sum","average_action_delay":"mean"})
     
+    #merge all features together
     user_state_featurized = pd.merge(user_number_submitted.reset_index(),user_state_pivot.reset_index(),on="sender",how="outer")
+    user_state_featurized.fillna(0,inplace=True) #@todo: this is not ideal, but I think there is a little bit of missing data due to EIP1559 capture errors. 
     user_state_featurized = pd.merge(user_state_featurized,gas_activity[["average_gas_behavior","stdev_gas_behavior","median_gas_behavior"]].reset_index(),on="sender",how="outer")
     user_state_featurized = pd.merge(user_state_featurized,users_actions[["average_action_delay","total_actions"]].reset_index(),on="sender",how="outer")
-    user_state_featurized["projectId"] = projectId
+    user_state_featurized["projectId"] = projectId #create projectId column
     return user_state_featurized
 
 auctions_all = []
 for projectId in auctions["projectId"].unique():
-    print("calculating for: ", projectId)
+    print("preprocessing data for auction #", projectId)
     auctions_all.append(preprocess_auction(auctions, projectId))
     
 auctions_all_df = pd.concat(auctions_all)
+auctions_all_df["average_action_delay"].fillna(2000,inplace=True) #fill default for 0 actions taken
+auctions_all_df["total_actions"].fillna(0,inplace=True) #fill default for 0 actions taken
+auctions_all_df["dropped"].fillna(0,inplace=True) #some auctions had 0 dropped so then shows up as nan after concat
 
 """appending user wallet data"""
 #there are 889 users out of 3385 who have an ENS registered on Ethereum. 
@@ -169,9 +181,8 @@ wh = wh.rename(columns={'user_address':'sender'})
 wh["time_since_first_tx"] = wh["time_since_first_tx"].apply(lambda x: "0" if x == "00:00:00" else x)
 wh["time_since_first_tx"]=wh["time_since_first_tx"].apply(lambda x: int(x.split(" ")[0]))
 
-auctions_all_df = pd.merge(auctions_all_df,wh,on="sender",how="outer")
+auctions_all_df = pd.merge(auctions_all_df,wh,on="sender",how="left")
 auctions_all_df.set_index(["sender","ens"],inplace=True)
-auctions_all_df.dropna(inplace=True)
 
 """
 
@@ -189,7 +200,7 @@ import seaborn as sns
 import plotly.express as px
 from plotly.offline import plot
 
-def run_clustering(df,cluster_algo,projectId=None):
+def run_clustering(df,cluster_algo,projectId=None,seed=42):
     """
     
     clusters and plots results for a given project    
@@ -203,7 +214,7 @@ def run_clustering(df,cluster_algo,projectId=None):
         df = df[df["projectId"]==projectId]
     df = df.drop(columns="projectId")
         
-    tsne = TSNE(n_components=2, verbose=0, perplexity=50, n_iter=300)
+    tsne = TSNE(n_components=2, verbose=0, perplexity=50, n_iter=300, random_state=seed)
     tsne_results = tsne.fit_transform(df)
     df[["tsne_0","tsne_1"]] = tsne_results
         
@@ -212,8 +223,9 @@ def run_clustering(df,cluster_algo,projectId=None):
     merged_components["clusters"] = y_pred
     merged_components["clusters"] = merged_components["clusters"].apply(lambda x: str(x))
     merged_components.reset_index(inplace=True)
+    print('Silhouette Score: ', metrics.silhouette_score(df[["tsne_0","tsne_1"]], cluster_algo.labels_))
 
-    # #elbow point, where decrease faster is better. 3 was best
+    # #elbow point, where decrease faster is better. To plot this, comment out the other charts below.
     # inertia = []
     # for k in range(1, clusters):
     #     cluster_algo = cluster_algo(n_clusters=k, random_state=1).fit(df[["tsne_0","tsne_1"]])
@@ -221,24 +233,28 @@ def run_clustering(df,cluster_algo,projectId=None):
     # plt.plot(range(1, clusters), inertia, marker='s');
     # plt.xlabel('$k$')
     # plt.ylabel('$J(C_k)$');
-
-    print('Silhouette Score: ', metrics.silhouette_score(df[["tsne_0","tsne_1"]], cluster_algo.labels_))
     
+    # scatterplot of clusters based on t-SNE
     fig, ax = plt.subplots(figsize=(10,10))
     sns.scatterplot(data=merged_components, x="tsne_0",y="tsne_1",hue="clusters", ax=ax)
     ax.set(title="User Auction Behavior Groups Project {}".format(projectId))
     
+    # boxplot of average_action_delay and average_gas_behavior
+    sns.boxplot(x=merged_components["clusters"],y=merged_components["average_action_delay"], title="{}")
+    sns.boxplot(x=merged_components["clusters"],y=merged_components["average_gas_behavior"], title="{}")
+
+    # # Density plot
+    # merged_components_melt = merged_components.set_index(["sender","ens","clusters"]).melt(ignore_index=False)
+    # merged_components_melt.reset_index(inplace=True, level=2)
+    # g = sns.FacetGrid(merged_components_melt, col="variable", hue="clusters", 
+    #                   sharey=False,sharex=False, col_wrap=5)
+    # g.map(sns.kdeplot, "value", shade=True)
+    # g.add_legend()
+    
+    # #plotly
     # fig = px.scatter(merged_components,x="tsne_0",y="tsne_1", color="clusters",hover_data=merged_components.columns)
     # plot(fig,filename="kmeans_{}.html".format(projectId))
     
-    # the following is more useful than pairplot for now
-    merged_components_melt = merged_components.set_index(["sender","ens","clusters"]).melt(ignore_index=False)
-    merged_components_melt.reset_index(inplace=True, level=2)
-    g = sns.FacetGrid(merged_components_melt, col="variable", hue="clusters", 
-                      sharey=False,sharex=False, col_wrap=5)
-    g.map(sns.kdeplot, "value", shade=True)
-    g.add_legend()
-
     #get dict for return
     cluster_dict = dict(zip(merged_components.sender,merged_components.clusters))
     return cluster_dict
@@ -247,31 +263,31 @@ def try_cluster(x, cluster_dict):
     if x in cluster_dict:
         return cluster_dict[x]
 
-# this is for percentage cluster setup
 auctions_temp = auctions_all_df.copy()
 auctions_temp.reset_index(inplace=True)
-# bidders_progression_df = auctions_all_df.reset_index()[["sender","ens"]].drop_duplicates()
+bidders_progression_df = auctions_all_df.reset_index()[["sender","ens"]].drop_duplicates()
 
-cluster_algo = KMeans(n_clusters=3, random_state=42) #3 and 4 both look fine
+seed=20
+cluster_algo = KMeans(n_clusters=3, random_state=seed) #3 and 4 both look fine
 for projectId in auctions["projectId"].unique():
     print(projectId)
-    project_cluster_dict = run_clustering(auctions_all_df,cluster_algo,projectId)
+    project_cluster_dict = run_clustering(auctions_all_df,cluster_algo,projectId,seed)
     column_name = "cluster_for_{}".format(projectId)
     
-    # bidders_progression_df[column_name] = bidders_progression_df["sender"].apply(lambda x: try_cluster(x,project_cluster_dict))
+    bidders_progression_df[column_name] = bidders_progression_df["sender"].apply(lambda x: try_cluster(x,project_cluster_dict))
     auctions_temp[column_name] = auctions_temp["sender"].apply(lambda x: try_cluster(x, project_cluster_dict))
 
 #get percentage failed per cluster for each project
-percentage_cluster = auctions_temp[auctions_temp["projectId"]==118].pivot_table(index="cluster_for_118",values=["number_submitted","failed","confirmed","cancel"],aggfunc="sum")
-percentage_cluster["percent_failed"] = (percentage_cluster["cancel"] + percentage_cluster["failed"])/percentage_cluster["number_submitted"]
-percentage_cluster["percent_confirmed"] = percentage_cluster["confirmed"]/percentage_cluster["number_submitted"]
+for projectId in projects_keep:
+    percentage_cluster = auctions_temp[auctions_temp["projectId"]==projectId].pivot_table(index="cluster_for_{}".format(projectId),values=["number_submitted","failed","confirmed","cancel","dropped"],aggfunc="sum")
+    percentage_cluster["percent_lost"] = (percentage_cluster["dropped"] + percentage_cluster["cancel"] + percentage_cluster["failed"])/percentage_cluster["number_submitted"]
+    percentage_cluster["percent_confirmed"] = percentage_cluster["confirmed"]/percentage_cluster["number_submitted"]
+    print(percentage_cluster)
 
-# @todo: add heatmap corr matrix, to see clusters relationships with variables. 
-# this is probably good for comparing across auctions maybe, show their cluster across variables. 
-# show main gas/action variables across auctions and also other variables? 
+# @todo: add heatmap corr matrix, show main gas/action variables across auctions and also other variables? 
 
-# # need to specify x and y cols better here before use
-# sns.pairplot(data=merged_components, height=3, hue="clusters", kind="scatter")
+# # need to specify x and y cols better here before next use. 
+# sns.pairplot(data=merged_components, x=["tsne-0","tsne-1], y=[], height=3, hue="clusters", kind="scatter")
 
 """graveyard"""
 ###putting all epochs together does nothing lol
@@ -300,7 +316,7 @@ percentage_cluster["percent_confirmed"] = percentage_cluster["confirmed"]/percen
 # sns.scatterplot(data=merged_components, x="PCA_0",y="PCA_1",hue="clusters", ax=ax)
 # ax.set(title="User Auction Behavior Groups")
 
-"""histogram of an auction over time, used for that one tweet only"""
+###histogram of an auction over time, used for that one tweet only
 # import seaborn as sns
 # import matplotlib.pyplot as plt
 # histogram_pivot = auctions.pivot_table(index=["blocknumber","tx_hash"],columns="status",values="gas_eth", aggfunc="mean")
