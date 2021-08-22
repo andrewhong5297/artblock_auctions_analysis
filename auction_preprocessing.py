@@ -22,7 +22,7 @@ preprocessing auction data
 118 is the only non-dutch auction.
 """
 
-auctions = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/auctions_821.csv')
+auctions = pd.read_csv(r'datasets/auctions_821.csv')
 projects_keep = [118,133,110,131,143,140]
 auctions = auctions[auctions["projectId"].isin(projects_keep)]
 
@@ -62,7 +62,7 @@ for project in list(set(auctions["projectId"])):
 auctions.drop(index=to_remove_indicies, inplace=True)
 
 #add in auction prices, and forward fill then backward fill for missing prices.
-auction_prices = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/dune_auction_prices.csv', index_col=0)
+auction_prices = pd.read_csv(r'datasets/dune_auction_prices.csv', index_col=0)
 auctions = pd.merge(auctions,auction_prices, how="left", left_on=["projectId","blocknumber"],right_on=["projectId","blocknumber"])
 auctions.sort_values(by=["projectId","blocknumber"], ascending=True, inplace=True)
 auctions["price_eth"].fillna(method="ffill", inplace=True)
@@ -196,7 +196,7 @@ auctions_all_df.loc[auctions_all_df[["cancel","confirmed","failed","dropped"]].e
 
 """appending user wallet data"""
 #there are 889 users out of 3385 who have an ENS registered on Ethereum. 
-wh = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/dune_auction_participants.csv', index_col=0)
+wh = pd.read_csv(r'datasets/dune_auction_participants.csv', index_col=0)
 wh.dropna(how="all",inplace=True)
 
 wh["user_address"] = wh["user_address"].apply(lambda x: x.replace("\\x","0x"))
@@ -370,7 +370,7 @@ for projectId in projects_keep:
 #     fig.set(xlim=(0,1),ylim=(0,250))
 #     plt.text(0.9, 150, "Number minted {}/{}".format(confirmed,total_supply), horizontalalignment='left', size='medium', color='black', weight='semibold')
 #     plt.tight_layout()
-#     fig.savefig(r"C:\Users\Andrew\OneDrive - nyu.edu\Documents\Python Script Backup\datasets\genart\artblocks\round_{}.png".format(time), quality = 85)
+#     fig.savefig(r"datasets\genart\artblocks\round_{}.png".format(time), quality = 85)
 
 # https://ezgif.com/maker/ezgif-2-a4ed6186-gif-equalized
 
@@ -380,8 +380,8 @@ for projectId in projects_keep:
 # def generate_final():
 #     gif_name = 'artblocks_dutch'
 #     fps = 3
-#     file_list = glob.glob(r"C:\Users\Andrew\OneDrive - nyu.edu\Documents\Python Script Backup\datasets\genart\artblocks\*")
+#     file_list = glob.glob(r"datasets\genart\artblocks\*")
 #     clip = mpy.ImageSequenceClip(file_list, fps=fps)
-#     clip.write_gif(r"C:\Users\Andrew\OneDrive - nyu.edu\Documents\Python Script Backup\datasets\genart\artblocks\{}.gif".format(gif_name), fps=fps)
+#     clip.write_gif(r"datasets\genart\artblocks\{}.gif".format(gif_name), fps=fps)
 
 # generate_final()
