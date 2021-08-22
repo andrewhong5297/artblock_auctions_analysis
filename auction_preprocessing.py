@@ -19,8 +19,9 @@ import datetime
 
 preprocessing auction data
 
+118 is the only non-dutch auction.
 """
-#will need to do something special for dutch versus normal auctions later... maybe can just be a dummy var flag for now. 
+
 auctions = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/auctions_821.csv')
 projects_keep = [118,133,110,131,143,140]
 auctions = auctions[auctions["projectId"].isin(projects_keep)]
@@ -54,11 +55,18 @@ to_remove_indicies = []
 for project in list(set(auctions["projectId"])):
     auction_spec = auctions[auctions["projectId"]==project]
     all_times = pd.Series(list(set(auction_spec.blocknumber)))
-    to_remove_blocktimes = all_times[(np.abs(stats.zscore(all_times)) > 2.5)] #remove values more than 2 std dev of time away. likely not part of main auction time
+    to_remove_blocktimes = all_times[(np.abs(stats.zscore(all_times)) > 2)] #remove values more than 2 std dev of time away. likely not part of main auction time
     if len(to_remove_blocktimes)==0:
         break
     to_remove_indicies.extend(auction_spec.index[auction_spec['blocknumber'].isin(to_remove_blocktimes)].tolist())
 auctions.drop(index=to_remove_indicies, inplace=True)
+
+#add in auction prices, and forward fill then backward fill for missing prices.
+auction_prices = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/dune_auction_prices.csv', index_col=0)
+auctions = pd.merge(auctions,auction_prices, how="left", left_on=["projectId","blocknumber"],right_on=["projectId","blocknumber"])
+auctions.sort_values(by=["projectId","blocknumber"], ascending=True, inplace=True)
+auctions["price_eth"].fillna(method="ffill", inplace=True)
+auctions["price_eth"].fillna(method="bfill", inplace=True)
 
 # get full user list for dune query
 all_users = list(set(auctions["sender"].apply(lambda x: x.replace('0x','\\x'))))
@@ -145,12 +153,16 @@ def preprocess_auction(df, projectId):
     get_first_pending["block_entry"] = get_first_pending["blocknumber"] - first_mint
     entry_pivot = get_first_pending.pivot_table(index="sender",values="block_entry",aggfunc="min")
     
+    #get price at time of participation
+    first_price = df.pivot_table(index="sender",values=["price_eth"], aggfunc="mean")
+    
     #merge all features together on outer join!
     user_state_featurized = pd.merge(user_number_submitted.reset_index(),user_state_pivot.reset_index(),on="sender",how="outer")
     user_state_featurized = pd.merge(user_state_featurized,gas_activity[["average_gas_behavior","stdev_gas_behavior","median_gas_behavior"]].reset_index(),on="sender",how="outer")
     user_state_featurized = pd.merge(user_state_featurized,users_actions[["average_action_delay","total_actions"]].reset_index(),on="sender",how="outer")
     user_state_featurized = pd.merge(user_state_featurized,entry_pivot["block_entry"].reset_index(),on="sender",how="outer")
-    
+    user_state_featurized = pd.merge(user_state_featurized,first_price["price_eth"].reset_index(),on="sender",how="outer")
+
     #for some transactions, it was never pending and went straight to final state. So block_entry, average_action_delay, and total_actions all currently show up as nan
     user_state_featurized.loc[user_state_featurized["block_entry"].isna(),"block_entry"] = user_state_featurized.loc[user_state_featurized["block_entry"].isna(),"sender"]\
         .apply(lambda x: df[df["sender"]==x]["blocknumber"].reset_index(drop=True).min() - first_mint) #convoluted line because user_state_featurized doesn't carry blocknumber column anymore 
@@ -247,7 +259,7 @@ def run_clustering(df,cluster_algo,projectId=None,seed=42):
     
     # scatterplot of clusters based on t-SNE
     fig, ax = plt.subplots(figsize=(10,10))
-    sns.scatterplot(data=merged_components, x="tsne_0",y="tsne_1",hue="clusters", ax=ax)
+    sns.scatterplot(data=merged_components, x="tsne_0",y="tsne_1",hue="clusters", ax=ax, palette={"0":"green","1":"blue","2":"orange"})
     ax.set(title="User Auction Behavior Groups Project {}".format(projectId))
 
     # Density plot
@@ -255,13 +267,15 @@ def run_clustering(df,cluster_algo,projectId=None,seed=42):
     merged_components_melt.reset_index(inplace=True, level=2)
     g = sns.FacetGrid(merged_components_melt, col="variable", hue="clusters", 
                       sharey=False,sharex=False, col_wrap=5)
-    g.map(sns.kdeplot, "value", shade=True)
+    g.map(sns.kdeplot, "value", shade=True, palette={"0":"green","1":"blue","2":"orange"})
     g.add_legend()
+        
+    # # Pair Plot
+    # sns.pairplot(data=merged_components, x_vars=merged_components.columns[2:18], y_vars=["tsne_0","tsne_1"], height=3, hue="clusters", kind="scatter")
     
     # # boxplot of average_action_delay and average_gas_behavior
     # fig2, ax2 = plt.subplots(figsize=(10,10)) 
     # sns.boxplot(x=merged_components["clusters"],y=merged_components["average_action_delay"], ax=ax2)
-    
     # fig3, ax3 = plt.subplots(figsize=(10,10)) 
     # sns.boxplot(x=merged_components["clusters"],y=merged_components["average_gas_behavior"], ax=ax3)
 
@@ -269,7 +283,6 @@ def run_clustering(df,cluster_algo,projectId=None,seed=42):
     # fig = px.scatter(merged_components,x="tsne_0",y="tsne_1", color="clusters",hover_data=merged_components.columns)
     # plot(fig,filename="kmeans_{}.html".format(projectId))
     
-    #get dict for return
     cluster_dict = dict(zip(merged_components.sender,merged_components.clusters))
     return cluster_dict
 
@@ -287,9 +300,11 @@ for projectId in auctions["projectId"].unique():
     print(projectId)
     project_cluster_dict = run_clustering(auctions_all_df,cluster_algo,projectId,seed)
     column_name = "cluster_for_{}".format(projectId)
-    
     bidders_progression_df[column_name] = bidders_progression_df["sender"].apply(lambda x: try_cluster(x,project_cluster_dict))
     auctions_temp[column_name] = auctions_temp["sender"].apply(lambda x: try_cluster(x, project_cluster_dict))
+
+##test
+run_clustering(auctions_all_df,cluster_algo,140,seed)
 
 #get percentage failed per cluster for each project
 for projectId in projects_keep:
@@ -297,11 +312,6 @@ for projectId in projects_keep:
     percentage_cluster["percent_lost"] = (percentage_cluster["dropped"] + percentage_cluster["cancel"] + percentage_cluster["failed"])/percentage_cluster["number_submitted"]
     percentage_cluster["percent_confirmed"] = percentage_cluster["confirmed"]/percentage_cluster["number_submitted"]
     print(percentage_cluster)
-
-# @todo: add heatmap corr matrix, show main gas/action variables across auctions and also other variables? 
-
-# # need to specify x and y cols better here before next use. 
-# sns.pairplot(data=merged_components, x=["tsne-0","tsne-1], y=[], height=3, hue="clusters", kind="scatter")
 
 """graveyard"""
 ###putting all epochs together does nothing lol
