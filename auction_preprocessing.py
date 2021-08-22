@@ -21,8 +21,8 @@ preprocessing auction data
 
 """
 #will need to do something special for dutch versus normal auctions later... maybe can just be a dummy var flag for now. 
-auctions = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/auctions_820.csv')
-projects_keep = [118,133,110]#,131,143,140]
+auctions = pd.read_csv(r'C:/Users/Andrew/OneDrive - nyu.edu/Documents/Python Script Backup/artblock_auctions_analytics/datasets/auctions_821.csv')
+projects_keep = [118,133,110,131,143,140]
 auctions = auctions[auctions["projectId"].isin(projects_keep)]
 
 auctions["sender"] = auctions["sender"].apply(lambda x: x.lower())
@@ -45,15 +45,11 @@ def recursive_tx_search(key):
 
 auctions["tx_hash"] = auctions["tx_hash"].apply(lambda x: recursive_tx_search(x))
 
-# #debugging, I think missing txs were due to wifi and overload issues
-# user_state_pivot = auctions[auctions["projectId"]==143].pivot_table(index=["sender","tx_hash"], columns="status",values="gas_eth", aggfunc="count")
-# user_state_pivot.fillna(0, inplace=True)
-
 ###removing some user outliers
 outliers = ["0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459","0x35632b6976b5b6ec3f8d700fabb7e1e0499c1bfa"] #these guys are super whales
 auctions = auctions[~auctions["sender"].isin(outliers)]
 
-#check for outliers in mint time, to remove those that were minted way before or after the auction.
+#check for outliers in mint time, to remove those that were minted way before or after the peak auction period.
 to_remove_indicies = []
 for project in list(set(auctions["projectId"])):
     auction_spec = auctions[auctions["projectId"]==project]
@@ -95,7 +91,7 @@ def get_actions_diff(row):
 def preprocess_auction(df, projectId):
     """
     
-    creates all the features for auction analysis. Could definitely be refactored 
+    creates all the features for auction analysis. Could definitely be refactored further for each feature calc.
     
     """
     if projectId not in df["projectId"].unique():
@@ -106,8 +102,6 @@ def preprocess_auction(df, projectId):
     ##@feature: calculate basic auction stats
     user_state_pivot = df.pivot_table(index=["sender"], columns="status",values="gas_eth", aggfunc="count")
     user_state_pivot.fillna(0, inplace=True)
-    
-    print("number users with missing outcomes {}/{}".format(user_state_pivot[user_state_pivot[["cancel","confirmed","failed"]].eq(0).all(1)].shape[0],user_state_pivot.shape[0]))
     user_state_pivot.drop(columns="pending", inplace=True)
     user_number_submitted = df.pivot_table(index="sender", values="tx_hash", aggfunc=lambda x: len(x.unique()))
     user_number_submitted.columns = ["number_submitted"]
@@ -131,7 +125,7 @@ def preprocess_auction(df, projectId):
     gas_activity["average_gas_behavior"] = gas_activity.mean(axis=1)
     gas_activity["median_gas_behavior"] = gas_activity.iloc[:,:-1].median(axis=1)
     gas_activity["stdev_gas_behavior"] = gas_activity.iloc[:,:-2].std(axis=1)
-    gas_activity["stdev_gas_behavior"].fillna(0,inplace=True) #no stdev for if only one block pending
+    gas_activity["stdev_gas_behavior"].fillna(0,inplace=True) #no stdev for if there was only one block pending
     
     ##@feature: getting time diff per row. Not sure if there is a way to map this across all rows. 
     get_first_pending = df[df["status"]=="pending"] #first submitted 
@@ -142,29 +136,42 @@ def preprocess_auction(df, projectId):
     
     sorting_blocknumber_columns = time_action.columns.sort_values(ascending=True)
     time_action = time_action[sorting_blocknumber_columns]
-    
     time_action["average_action_delay"] = time_action.apply(lambda x: get_actions_diff(x),axis=1)
     time_action["total_actions"] = time_action.iloc[:,:-1].sum(axis=1)
-    
-    #pivot a final time by sender agg by tx_hash
     users_actions = time_action.reset_index().pivot_table(index="sender",values=["total_actions","average_action_delay"], 
                                                           aggfunc={"total_actions":"sum","average_action_delay":"mean"})
-    
     #get time of participation
-    get_first_pending["block_entry"] = get_first_pending["blocknumber"] - get_first_pending["blocknumber"].min()
+    first_mint = get_first_pending["blocknumber"].min()
+    get_first_pending["block_entry"] = get_first_pending["blocknumber"] - first_mint
     entry_pivot = get_first_pending.pivot_table(index="sender",values="block_entry",aggfunc="min")
     
-    #merge all features together
+    #merge all features together on outer join!
     user_state_featurized = pd.merge(user_number_submitted.reset_index(),user_state_pivot.reset_index(),on="sender",how="outer")
-    user_state_featurized.fillna(0,inplace=True) #@todo: this is not ideal, but I think there is a little bit of missing data due to EIP1559 capture errors. 
     user_state_featurized = pd.merge(user_state_featurized,gas_activity[["average_gas_behavior","stdev_gas_behavior","median_gas_behavior"]].reset_index(),on="sender",how="outer")
     user_state_featurized = pd.merge(user_state_featurized,users_actions[["average_action_delay","total_actions"]].reset_index(),on="sender",how="outer")
-    user_state_featurized = pd.merge(user_state_featurized,entry_pivot["block_entry"].reset_index(),on="sender",how="right") #@todo drop users who pending missing
+    user_state_featurized = pd.merge(user_state_featurized,entry_pivot["block_entry"].reset_index(),on="sender",how="outer")
+    
+    #for some transactions, it was never pending and went straight to final state. So block_entry, average_action_delay, and total_actions all currently show up as nan
+    user_state_featurized.loc[user_state_featurized["block_entry"].isna(),"block_entry"] = user_state_featurized.loc[user_state_featurized["block_entry"].isna(),"sender"]\
+        .apply(lambda x: df[df["sender"]==x]["blocknumber"].reset_index(drop=True).min() - first_mint) #convoluted line because user_state_featurized doesn't carry blocknumber column anymore 
+    user_state_featurized = user_state_featurized[user_state_featurized["block_entry"]>=0] #don't include those who minted before the auction started.
+    user_state_featurized.loc[user_state_featurized["average_action_delay"].isna(),"average_action_delay"] = 2000 
+    user_state_featurized.loc[user_state_featurized["total_actions"].isna(),"total_actions"] = 1 
+
+    user_state_featurized["block_entry"] = pd.to_numeric(user_state_featurized["block_entry"])
     user_state_featurized["projectId"] = projectId #create projectId column
     return user_state_featurized
 
-projectId=118
-df = auctions
+# ##testing start
+# projectId=140
+# df = auctions[auctions["projectId"]==projectId]
+# user_state_pivot = df.pivot_table(index=["sender","tx_hash"], columns="status",values="gas_eth", aggfunc="count")
+# user_state_pivot.fillna(0, inplace=True) 
+# user_state_pivot.reset_index(inplace=True)
+
+# x='0x94a465183ff9a939295d3c8cc09b5ca27a63fb9c'
+# tx_track = df[df["sender"]=='0x94a465183ff9a939295d3c8cc09b5ca27a63fb9c']
+# ##testing end
 
 auctions_all = []
 for projectId in auctions["projectId"].unique():
@@ -172,10 +179,8 @@ for projectId in auctions["projectId"].unique():
     auctions_all.append(preprocess_auction(auctions, projectId))
     
 auctions_all_df = pd.concat(auctions_all)
-auctions_all_df["average_action_delay"].fillna(2000,inplace=True) #fill default for 0 actions taken
-auctions_all_df["total_actions"].fillna(0,inplace=True) #fill default for 0 actions taken
 auctions_all_df["dropped"].fillna(0,inplace=True) #some auctions had 0 dropped so then shows up as nan after concat
-auctions_all_df = auctions_all_df[~auctions_all_df[["cancel","confirmed","failed","dropped"]].eq(0).all(1)] #filter out those with no results
+auctions_all_df.loc[auctions_all_df[["cancel","confirmed","failed","dropped"]].eq(0).all(1),"failed"] = 1 #after I checked many of them manually, all of the txs with missing end states are failed, though I'm not sure why they don't show up in mempool data. 
 
 """appending user wallet data"""
 #there are 889 users out of 3385 who have an ENS registered on Ethereum. 
@@ -233,10 +238,10 @@ def run_clustering(df,cluster_algo,projectId=None,seed=42):
 
     # #elbow point, where decrease faster is better. To plot this, comment out the other charts below.
     # inertia = []
-    # for k in range(1, clusters):
-    #     cluster_algo = cluster_algo(n_clusters=k, random_state=1).fit(df[["tsne_0","tsne_1"]])
+    # for k in range(1, 8):
+    #     kmeans = KMeans(n_clusters=k, random_state=1).fit(df[["tsne_0","tsne_1"]])
     #     inertia.append(np.sqrt(kmeans.inertia_))   
-    # plt.plot(range(1, clusters), inertia, marker='s');
+    # plt.plot(range(1, 8), inertia, marker='s');
     # plt.xlabel('$k$')
     # plt.ylabel('$J(C_k)$');
     
