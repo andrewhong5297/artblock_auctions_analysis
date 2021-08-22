@@ -259,7 +259,7 @@ def run_clustering(df,cluster_algo,projectId=None,seed=42):
     
     # scatterplot of clusters based on t-SNE
     fig, ax = plt.subplots(figsize=(10,10))
-    sns.scatterplot(data=merged_components, x="tsne_0",y="tsne_1",hue="clusters", ax=ax, palette={"0":"green","1":"blue","2":"orange"})
+    sns.scatterplot(data=merged_components, x="tsne_0",y="tsne_1",hue="clusters", ax=ax, palette={"0":"orange","1":"blue","2":"green"})
     ax.set(title="User Auction Behavior Groups Project {}".format(projectId))
 
     # Density plot
@@ -267,7 +267,7 @@ def run_clustering(df,cluster_algo,projectId=None,seed=42):
     merged_components_melt.reset_index(inplace=True, level=2)
     g = sns.FacetGrid(merged_components_melt, col="variable", hue="clusters", 
                       sharey=False,sharex=False, col_wrap=5)
-    g.map(sns.kdeplot, "value", shade=True, palette={"0":"green","1":"blue","2":"orange"})
+    g.map(sns.kdeplot, "value", shade=True)
     g.add_legend()
         
     # # Pair Plot
@@ -304,7 +304,7 @@ for projectId in auctions["projectId"].unique():
     auctions_temp[column_name] = auctions_temp["sender"].apply(lambda x: try_cluster(x, project_cluster_dict))
 
 ##test
-run_clustering(auctions_all_df,cluster_algo,140,seed)
+run_clustering(auctions_all_df,cluster_algo,118,seed)
 
 #get percentage failed per cluster for each project
 for projectId in projects_keep:
