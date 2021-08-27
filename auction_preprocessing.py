@@ -22,8 +22,8 @@ preprocessing auction data
 118 is the only non-dutch auction.
 """
 
-auctions = pd.read_csv(r'datasets/auctions_821.csv')
-projects_keep = [118,133,110,131,143,140]
+auctions = pd.read_csv(r'datasets/auctions_827.csv')
+projects_keep = [118,133,110,131,143,140,142,141,136,139,138]
 auctions = auctions[auctions["projectId"].isin(projects_keep)]
 
 auctions["sender"] = auctions["sender"].apply(lambda x: x.lower())
@@ -198,11 +198,15 @@ auctions_all_df.loc[auctions_all_df[["cancel","confirmed","failed","dropped"]].e
 #there are 889 users out of 3385 who have an ENS registered on Ethereum. 
 wh = pd.read_csv(r'datasets/dune_auction_participants.csv', index_col=0)
 wh.dropna(how="all",inplace=True)
+wh.fillna("0",inplace=True)
 
 wh["user_address"] = wh["user_address"].apply(lambda x: x.replace("\\x","0x"))
 wh = wh.rename(columns={'user_address':'sender'})
 wh["time_since_first_tx"] = wh["time_since_first_tx"].apply(lambda x: "0" if x == "00:00:00" else x)
 wh["time_since_first_tx"]=wh["time_since_first_tx"].apply(lambda x: int(x.split(" ")[0]))
+
+wh["number_of_txs"] = wh["number_of_txs"].astype(float)
+wh["total_gas_eth"] = wh["total_gas_eth"].astype(float)
 
 auctions_all_df = pd.merge(auctions_all_df,wh,on="sender",how="left")
 auctions_all_df.set_index(["sender","ens"],inplace=True)
